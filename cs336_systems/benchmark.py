@@ -10,7 +10,6 @@ import numpy as np
 import time
 import torch
 import typer
-from typing import Literal
 
 from cs336_basics.data import get_batch
 from cs336_basics.model import BasicsTransformerLM
@@ -128,7 +127,7 @@ app = typer.Typer(help="Benchmark transfomer models")
 
 @app.command()
 def main(
-    models: list[Literal["small", "medium", "large", "xl", "2.7B", "all"]] = typer.Option(
+    models: list[str] = typer.Option(
         ["all"], "--model", "-m", help="Models to benchmark (can specify multiple)"
     ),
     vocab_size: int = typer.Option(10000, "--vocab-size"),
