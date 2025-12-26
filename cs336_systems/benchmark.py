@@ -5,15 +5,23 @@ Section 1.1: Profiling and Benchmarking
 Times forward and backward passes of a model, with ability to vary hyperparameters.
 """
 
+from contextlib import nullcontext
+from einops import einsum
+from jaxtyping import Bool, Float
 import json
+import math
 import numpy as np
 import time
 import torch
+import torch.cuda.nvtx as nvtx
 import typer
+from typing import Optional
 
 from cs336_basics.data import get_batch
-from cs336_basics.model import BasicsTransformerLM
+import cs336_basics.model
+from cs336_basics.model import BasicsTransformerLM, softmax
 from cs336_basics.nn_utils import cross_entropy
+from cs336_basics.optimizer import AdamW
 
 model_parameters = {
     "small": {
@@ -48,6 +56,30 @@ model_parameters = {
     },
 }
 
+@nvtx.range("scaled dot product attention")
+def annotated_scaled_dot_product_attention(
+    Q: Float[torch.Tensor, " ... queries d_k"],
+    K: Float[torch.Tensor, " ... keys    d_k"],
+    V: Float[torch.Tensor, " ... keys    d_v"],
+    mask: Bool[torch.Tensor, " ... queries keys"] | None = None,
+) -> Float[torch.Tensor, " ... queries d_v"]:
+    """
+    Annotated scaled dot-product attention.
+    """
+    d_k = K.shape[-1]
+    with nvtx.range("computing attention scores"):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+
+    if mask is not None:
+        attention_scores = torch.where(mask, attention_scores, float("-inf"))
+    with nvtx.range("computing softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+
+    with nvtx.range("final matmul"):
+        return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+
+cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+
 def benchmark_model(
     vocab_size: int,
     context_length: int,
@@ -61,6 +93,8 @@ def benchmark_model(
     benchmark_steps: int,
     forward_only: bool,
     device: str,
+    mixed_precision: bool,
+    profile_memory: bool,
 ) -> dict[str, float]:
     """
     Given hyperparameters, initialize a model. Generate a random batch of data.
@@ -77,6 +111,7 @@ def benchmark_model(
         rope_theta=rope_theta,
     ).to(device)
     model.train()
+    optimizer = AdamW(model.parameters())
     # Generate random batch of data
     dataset = np.arange(vocab_size)
     inputs, targets = get_batch(
@@ -90,29 +125,51 @@ def benchmark_model(
         if device.startswith("cuda"):
             torch.cuda.synchronize()
 
-    # Run w warmup steps
-    for _ in range(warmup_steps):
-        outs = model(inputs)
-        sync()
-        if not forward_only:
-            loss = cross_entropy(outs, targets)
-            loss.backward()
-            model.zero_grad()
-            sync()
+    model_context = (
+        torch.autocast(device_type=device, dtype=torch.bfloat16) 
+        if mixed_precision else nullcontext()
+    )
 
+    # Run w warmup steps
+    with nvtx.range("warmup steps"):
+        for _ in range(warmup_steps):
+            with model_context:
+                outs = model(inputs)
+            sync()
+            if not forward_only:
+                loss = cross_entropy(outs, targets)
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                sync()
+
+    if profile_memory:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
     benchmark_times = np.zeros(benchmark_steps, dtype=np.float64)
     # Benchmark n steps
-    for step in range(benchmark_steps):
-        start_time = time.perf_counter()
-        outs = model(inputs)
-        sync()
-        if not forward_only:
-            loss = cross_entropy(outs, targets)
-            loss.backward()
-            model.zero_grad()
-            sync()
-        end_time = time.perf_counter()
-        benchmark_times[step] = end_time - start_time
+    with nvtx.range("benchmark steps"):
+        for step in range(benchmark_steps):
+            start_time = time.perf_counter()
+            with nvtx.range("forward pass"):
+                with model_context:
+                    outs = model(inputs)
+                sync()
+            if not forward_only:
+                with nvtx.range("backward pass"):
+                    loss = cross_entropy(outs, targets)
+                    loss.backward()
+                    sync()
+                with nvtx.range("optimizer step"):
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    sync()
+            end_time = time.perf_counter()
+            benchmark_times[step] = end_time - start_time
+    if profile_memory:
+        pass_str = "forward" if forward_only else "fullstep"
+        mixed_str = "mixed" if mixed_precision else "fullprecision"
+        torch.cuda.memory._dump_snapshot(f"memory_snapshot_{pass_str}_{mixed_str}_{context_length}.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     results = {
         "forward_only": forward_only,
@@ -138,6 +195,8 @@ def main(
     benchmark_steps: int = typer.Option(10, "--benchmark-steps"),
     forward_only: bool = typer.Option(False, "--forward-only", help="Only benchmark forward pass"),
     device: str = typer.Option("cuda", "--device", help="Device to use (cuda/cpu)"),
+    mixed_precision: bool = typer.Option(False, "--mixed-precision", help="mixed precision using bfloat16"),
+    profile_memory: bool = typer.Option(False, "--profile-memory", help="memory profiling with PyTorch"),
     output_json: str = typer.Option(None, "--output-json", help="Path to save JSON results"),
 ):
     """
@@ -163,6 +222,8 @@ def main(
             benchmark_steps=benchmark_steps,
             forward_only=forward_only,
             device=device,
+            mixed_precision=mixed_precision,
+            profile_memory=profile_memory,
         )
 
     if output_json:
