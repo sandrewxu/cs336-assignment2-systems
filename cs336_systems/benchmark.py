@@ -95,6 +95,7 @@ def benchmark_model(
     device: str,
     mixed_precision: bool,
     profile_memory: bool,
+    compile: bool,
 ) -> dict[str, float]:
     """
     Given hyperparameters, initialize a model. Generate a random batch of data.
@@ -110,6 +111,8 @@ def benchmark_model(
         d_ff=d_ff,
         rope_theta=rope_theta,
     ).to(device)
+    if compile:
+        model = torch.compile(model)
     model.train()
     optimizer = AdamW(model.parameters())
     # Generate random batch of data
@@ -197,6 +200,7 @@ def main(
     device: str = typer.Option("cuda", "--device", help="Device to use (cuda/cpu)"),
     mixed_precision: bool = typer.Option(False, "--mixed-precision", help="mixed precision using bfloat16"),
     profile_memory: bool = typer.Option(False, "--profile-memory", help="memory profiling with PyTorch"),
+    compile: bool = typer.Option(False, "--compile", help="torch.compile"),
     output_json: str = typer.Option(None, "--output-json", help="Path to save JSON results"),
 ):
     """
@@ -224,6 +228,7 @@ def main(
             device=device,
             mixed_precision=mixed_precision,
             profile_memory=profile_memory,
+            compile=compile
         )
 
     if output_json:
