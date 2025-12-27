@@ -93,11 +93,14 @@ class FlashAttentionPyTorch(torch.autograd.Function):
                 L[batch, q_start:q_end] = L_i
 
         ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
         return O
 
     @staticmethod
-    def backward():
-        raise NotImplementedError
+    def backward(ctx, grad_out):
+        L, Q, K, V, O = ctx.saved_tensors
+        dQ, dV, dO = compiled_backward(L, Q, K, V, O, grad_out, ctx.is_causal)
+        return dQ, dV, dO, None
 
 @triton.jit
 def flash_fwd_kernel(
@@ -229,12 +232,12 @@ def flash_backward(L, Q, K, V, O, grad_out, is_causal):
         causal_mask = torch.triu(torch.ones_like(S, dtype=torch.bool), diagonal=1)
         S = S.masked_fill(causal_mask, -1e6)
 
-    P = torch.exp(S - L)
-    grad_values = einsum(P, grad_out, "... query key, ... query d_model", "... key d_model")
-    grad_P = einsum(grad_out, V, "... query d_model, ... key d_model", "... query key")
+    P = torch.exp(S - L.unsqueeze(-1))
+    grad_values = einsum(P, grad_out, "... query key, ... query d_model -> ... key d_model")
+    grad_P = einsum(grad_out, V, "... query d_model, ... key d_model -> ... query key")
     grad_S = P * (grad_P - D.unsqueeze(-1))
     grad_queries = einsum(grad_S, K, "... query key, ... key d_model -> ... query d_model") / math.sqrt(d_model)
-    grad_keys = einsum(grad_S, Q, "... query key, ... query d_model, ... key d_model") / math.sqrt(d_model)
+    grad_keys = einsum(grad_S, Q, "... query key, ... query d_model -> ... key d_model") / math.sqrt(d_model)
     return grad_queries, grad_keys, grad_values
 
 compiled_backward = torch.compile(flash_backward)
@@ -311,4 +314,5 @@ class FlashAttention2(torch.autograd.Function):
             grad_values
         """
         L, Q, K, V, O = ctx.saved_tensors
-        return compiled_backward(L, Q, K, V, O, grad_out, ctx.is_causal)
+        dQ, dV, dO = compiled_backward(L, Q, K, V, O, grad_out, ctx.is_causal)
+        return dQ, dV, dO, None
