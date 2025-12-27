@@ -113,6 +113,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
 ):
     """
     Fused attention kernel, tile of a single batch.
@@ -174,12 +175,25 @@ def flash_fwd_kernel(
     O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
     l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     m = tl.full((Q_TILE_SIZE,), -float("inf"), dtype=tl.float32)
+
+    # Compute absolute query indices for tile
+    q_start_idx = query_tile_index * Q_TILE_SIZE
+    q_indices = q_start_idx + tl.arange(0, Q_TILE_SIZE)
+
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         # Load Kj, Vj from global memory
+        k_start_idx = j * K_TILE_SIZE
+        k_indices = k_start_idx + tl.arange(0, K_TILE_SIZE)  # (K_TILE_SIZE,)
+
         Kj = tl.load(K_block_ptr, boundary_check=(0,), padding_option="zero")   # (K_TILE_SIZE, D)
         Vj = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")   # (K_TILE_SIZE, D)
         # Compute QK^T
         S_ij = tl.dot(Q_i, tl.trans(Kj)) * scale    # (Q_TILE_SIZE, K_TILE_SIZE)
+
+        if is_causal:
+            causal_mask = q_indices[:, None] < k_indices[None, :]
+            S_ij = S_ij + tl.where(causal_mask, -1e6, 0.0)
+
         # Compute m
         row_maxes = tl.max(S_ij, axis=1)    # (Q_TILE_SIZE,)
         m_new = tl.maximum(m, row_maxes)   # (Q_TILE_SIZE,)
@@ -202,6 +216,28 @@ def flash_fwd_kernel(
     # Write to global memory
     tl.store(O_block_ptr, O_i, boundary_check=(0,))
     tl.store(L_block_ptr, l, boundary_check=(0,))
+
+def flash_backward(L, Q, K, V, O, grad_out, is_causal):
+    """
+    PyTorch implementation of backward pass that can be compiled.
+    """
+    d_model = Q.shape[-1]
+
+    D = torch.sum(O * grad_out, dim=-1) # "... query"
+    S = einsum(Q, K, "... query d_model, ... key d_model -> ... query key") / math.sqrt(d_model)
+    if is_causal:
+        causal_mask = torch.triu(torch.ones_like(S, dtype=torch.bool), diagonal=1)
+        S = S.masked_fill(causal_mask, -1e6)
+
+    P = torch.exp(S - L)
+    grad_values = einsum(P, grad_out, "... query key, ... query d_model", "... key d_model")
+    grad_P = einsum(grad_out, V, "... query d_model, ... key d_model", "... query key")
+    grad_S = P * (grad_P - D.unsqueeze(-1))
+    grad_queries = einsum(grad_S, K, "... query key, ... key d_model -> ... query d_model") / math.sqrt(d_model)
+    grad_keys = einsum(grad_S, Q, "... query key, ... query d_model, ... key d_model") / math.sqrt(d_model)
+    return grad_queries, grad_keys, grad_values
+
+compiled_backward = torch.compile(flash_backward)
 
 class FlashAttention2(torch.autograd.Function):
     """
@@ -232,7 +268,7 @@ class FlashAttention2(torch.autograd.Function):
         key = K.shape[-2]
 
         # Tile sizes must be at least 16x16
-        ctx.Q_TILE_SIZE = 16    # B_q
+        ctx.Q_TILE_SIZE = 16   # B_q
         ctx.K_TILE_SIZE = 16   # B_k
 
         # Create O and L tensors
@@ -253,11 +289,26 @@ class FlashAttention2(torch.autograd.Function):
             d_model,
             ctx.Q_TILE_SIZE,
             ctx.K_TILE_SIZE,
+            is_causal,
         )
 
         ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
         return O
 
     @staticmethod
-    def backward():
-        raise NotImplementedError
+    def backward(ctx, grad_out):
+        """
+        Backward pass of a fused attention kernel.
+        Using PyTorch, NOT Triton
+        Optimized with torch.compile
+
+        grad_out is dO
+
+        Returns:
+            grad_queries
+            grad_keys
+            grad_values
+        """
+        L, Q, K, V, O = ctx.saved_tensors
+        return compiled_backward(L, Q, K, V, O, grad_out, ctx.is_causal)
