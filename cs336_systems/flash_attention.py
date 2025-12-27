@@ -214,10 +214,9 @@ def flash_fwd_kernel(
 
     # Compute the final values of O_i and l
     O_i = O_i / l[:, None]
-    O_i.to(O_block_ptr.type.element_ty)
     l = m + tl.log(l)
     # Write to global memory
-    tl.store(O_block_ptr, O_i, boundary_check=(0,))
+    tl.store(O_block_ptr, O_i.to(O_block_ptr.type.element_ty), boundary_check=(0,))
     tl.store(L_block_ptr, l, boundary_check=(0,))
 
 def flash_backward(L, Q, K, V, O, grad_out, is_causal):
