@@ -136,7 +136,7 @@ def flash_fwd_kernel(
         K_ptr + batch_index * stride_kb,
         shape=(N_KEYS, D),
         strides=(stride_kk, stride_kd),
-        offsets=(0, K_TILE_SIZE),
+        offsets=(0, 0),
         block_shape=(K_TILE_SIZE, D),
         order=(1, 0),
     )
@@ -145,7 +145,7 @@ def flash_fwd_kernel(
         V_ptr + batch_index * stride_vb,
         shape=(N_KEYS, D),
         strides=(stride_vk, stride_vd),
-        offsets=(0, K_TILE_SIZE),
+        offsets=(0, 0),
         block_shape=(K_TILE_SIZE, D),
         order=(1, 0),
     )
@@ -168,47 +168,40 @@ def flash_fwd_kernel(
         order=(0,),
     )
 
-    # Loop
-    for i in range(tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
-        # Load Q_i from global memory
-        Q_i = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE, D)
-        # Initialize buffers to write to
-        O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-        l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
-        m = tl.full((Q_TILE_SIZE,), -float("Inf"), dtype=tl.float32)
-        for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
-            # Load Kj, Vj from global memory
-            Kj = tl.load(K_block_ptr, boundary_check=(0,), padding_option="zero")   # (K_TILE_SIZE, D)
-            Vj = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")   # (K_TILE_SIZE, D)
-            # Compute QK^T
-            S_ij = tl.dot(Q_i, Kj.T) * scale    # (Q_TILE_SIZE, K_TILE_SIZE)
-            # Compute m
-            row_maxes = tl.max(S_ij, dim=-1)    # (Q_TILE_SIZE,)
-            m_new = tl.max(tl.join(m, row_maxes), dim=-1)   # (Q_TILE_SIZE,)
-            # P_ij
-            P_ij = tl.exp(S_ij - m_new) # (Q_TILE_SIZE, K_TILE_SIZE)
-            # l
-            alpha = tl.exp(m - m_new)
-            l = alpha * l + tl.sum(P_ij, dim=-1)    # (Q_TILE_SIZE,)
-            # O_i
-            P_ij.to(Vj.dtype)
-            O_i = alpha.unsqueeze(-1) * O_i + tl.dot(P_ij, Vj)
-            # Update m, advance pointers
-            m = m_new
-            K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
-            V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+    # Load Q_i from global memory
+    Q_i = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")  # (Q_TILE_SIZE, D)
+    # Initialize buffers to write to
+    O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    l = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    m = tl.full((Q_TILE_SIZE,), -float("inf"), dtype=tl.float32)
+    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        # Load Kj, Vj from global memory
+        Kj = tl.load(K_block_ptr, boundary_check=(0,), padding_option="zero")   # (K_TILE_SIZE, D)
+        Vj = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")   # (K_TILE_SIZE, D)
+        # Compute QK^T
+        S_ij = tl.dot(Q_i, tl.trans(Kj)) * scale    # (Q_TILE_SIZE, K_TILE_SIZE)
+        # Compute m
+        row_maxes = tl.max(S_ij, axis=1)    # (Q_TILE_SIZE,)
+        m_new = tl.maximum(m, row_maxes)   # (Q_TILE_SIZE,)
+        # P_ij
+        P_ij = tl.exp(S_ij - m_new[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
+        # l
+        alpha = tl.exp(m - m_new)
+        l = alpha * l + tl.sum(P_ij, axis=1)    # (Q_TILE_SIZE,)
+        # O_i
+        O_i = alpha[:, None] * O_i + tl.dot(P_ij.to(Vj.dtype), Vj)
+        # Update m, advance pointers
+        m = m_new
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
-        # Compute the final values of O_i and l
-        O_i = O_i / l.unsqueeze(-1)
-        O_i.to(O_block_ptr.type.element_ty)
-        l = m + tl.log(l)
-        # Write to global memory
-        tl.store(O_block_ptr, O_i, boundary_check=(0,))
-        tl.store(L_block_ptr, l, boundary_check=(0,))
-        # Advance pointers
-        Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
-        O_block_ptr = O_block_ptr.advance((Q_TILE_SIZE, 0))
-        L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+    # Compute the final values of O_i and l
+    O_i = O_i / l[:, None]
+    O_i.to(O_block_ptr.type.element_ty)
+    l = m + tl.log(l)
+    # Write to global memory
+    tl.store(O_block_ptr, O_i, boundary_check=(0,))
+    tl.store(L_block_ptr, l, boundary_check=(0,))
 
 class FlashAttention2(torch.autograd.Function):
     """
@@ -240,14 +233,14 @@ class FlashAttention2(torch.autograd.Function):
 
         # Tile sizes must be at least 16x16
         ctx.Q_TILE_SIZE = 16    # B_q
-        ctx.KV_TILE_SIZE = 16   # B_k
+        ctx.K_TILE_SIZE = 16   # B_k
 
         # Create O and L tensors
-        O = torch.empty((batch_size, query, d_model))   # (batch, B_q, d_model)
-        L = torch.empty((batch_size, query))    # (batch, B_q,)
+        O = torch.empty((batch_size, query, d_model), device=Q.device, dtype=Q.dtype)   # (batch, B_q, d_model)
+        L = torch.empty((batch_size, query), device=Q.device, dtype=torch.float32)    # (batch, B_q,)
 
         # Run kernel with launch grid (T_q, batch_size)
-        flash_fwd_kernel[(tl.cdiv(query, ctx.Q_TILE_SIZE, batch_size))](
+        flash_fwd_kernel[(math.ceil(query / ctx.Q_TILE_SIZE), batch_size)](
             Q, K, V,
             O, L,
             Q.stride(0), Q.stride(1), Q.stride(2),
@@ -257,6 +250,7 @@ class FlashAttention2(torch.autograd.Function):
             L.stride(0), L.stride(1),
             query, key,
             1/math.sqrt(d_model),
+            d_model,
             ctx.Q_TILE_SIZE,
             ctx.K_TILE_SIZE,
         )
