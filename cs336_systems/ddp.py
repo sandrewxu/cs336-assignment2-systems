@@ -39,6 +39,39 @@ def _infer_device(rank: int, backend: str) -> str:
         return f"cuda:{local_rank}"
     return "cpu"
 
+def _allreduce_flat_grads(model: torch.nn.Module, world_size: int) -> None:
+    """
+    Naive DDP gradient synchronization by flattening all grads into a single tensor,
+    all-reducing once, then unflattening back into per-parameter grads.
+    """
+    params_with_grad: list[torch.nn.Parameter] = []
+    grads: list[torch.Tensor] = []
+    for p in model.parameters():
+        g = p.grad
+        if g is None:
+            continue
+        # This helper only supports dense grads (which is what we have for transformer training).
+        if g.is_sparse:
+            raise RuntimeError("Sparse gradients are not supported by _allreduce_flat_grads.")
+        params_with_grad.append(p)
+        grads.append(g)
+
+    if not grads:
+        return
+
+    # Pack with torch internal utilities (dense only)
+    flat = torch._utils._flatten_dense_tensors(grads)
+
+    # Communicate (SUM then average)
+    dist.all_reduce(flat)
+    flat.div_(world_size)
+
+    # Unpack back into existing grad tensors (preserves optimizer references)
+    synced_grads = torch._utils._unflatten_dense_tensors(flat, grads)
+    for p, synced_g in zip(params_with_grad, synced_grads):
+        # copy_ into the existing grad tensor object
+        p.grad.copy_(synced_g)
+
 def _ddp_worker(
     rank,
     world_size,
@@ -103,12 +136,9 @@ def _ddp_worker(
         loss = cross_entropy(outs, targets)
         loss.backward()
 
-        # all_reduce and average grads
-        with torch.inference_mode():
-            for p in model.parameters():
-                if p.grad is not None:
-                    dist.all_reduce(p.grad)
-                    p.grad.div_(world_size)
+        # all_reduce and average grads (flat buffer)
+        with torch.no_grad():
+            _allreduce_flat_grads(model=model, world_size=world_size)
 
         optimizer.step()
         _sync(device)
@@ -129,11 +159,8 @@ def _ddp_worker(
 
         _sync(device)
         comm_start = time.perf_counter()
-        with torch.inference_mode():
-            for p in model.parameters():
-                if p.grad is not None:
-                    dist.all_reduce(p.grad)
-                    p.grad.div_(world_size)
+        with torch.no_grad():
+            _allreduce_flat_grads(model=model, world_size=world_size)
         _sync(device)
         comm_end = time.perf_counter()
 
