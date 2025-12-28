@@ -13,6 +13,7 @@ from cs336_basics.data import get_batch
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
+from cs336_systems.ddp import DDP_overlap
 
 def setup(rank, world_size, backend="nccl"):
     os.environ["MASTER_ADDR"] = "localhost"
@@ -107,13 +108,17 @@ def _ddp_worker(
         rope_theta=rope_theta,
     ).to(device)
 
-    # broadcast initial params from rank 0
-    with torch.inference_mode():
-        for p in model.parameters():
-            dist.broadcast(p.data, src=0)
+    ddp_model = DDP_overlap(model)
+    ddp_model.train()
+    optimizer = AdamW(ddp_model.parameters())
 
-    model.train()
-    optimizer = AdamW(model.parameters())
+    # # broadcast initial params from rank 0
+    # with torch.inference_mode():
+    #     for p in model.parameters():
+    #         dist.broadcast(p.data, src=0)
+
+    # model.train()
+    # optimizer = AdamW(model.parameters())
 
     dataset = np.arange(vocab_size)
     torch.manual_seed(0)
@@ -132,13 +137,17 @@ def _ddp_worker(
     # Warmup
     for _ in range(warmup_steps):
         optimizer.zero_grad(set_to_none=True)
-        outs = model(inputs)
+        # outs = model(inputs)
+        outs = ddp_model(inputs)
         loss = cross_entropy(outs, targets)
         loss.backward()
+        _sync(device)
+        ddp_model.finish_gradient_synchronization()
+        _sync(device)
 
-        # all_reduce and average grads (flat buffer)
-        with torch.no_grad():
-            _allreduce_flat_grads(model=model, world_size=world_size)
+        # # all_reduce and average grads (flat buffer)
+        # with torch.no_grad():
+        #     _allreduce_flat_grads(model=model, world_size=world_size)
 
         optimizer.step()
         _sync(device)
@@ -153,14 +162,16 @@ def _ddp_worker(
         _sync(device)
         step_start = time.perf_counter()
 
-        outs = model(inputs)
+        # outs = model(inputs)
+        outs = ddp_model(inputs)
         loss = cross_entropy(outs, targets)
         loss.backward()
 
         _sync(device)
         comm_start = time.perf_counter()
-        with torch.no_grad():
-            _allreduce_flat_grads(model=model, world_size=world_size)
+        ddp_model.finish_gradient_synchronization()
+        # with torch.no_grad():
+        #     _allreduce_flat_grads(model=model, world_size=world_size)
         _sync(device)
         comm_end = time.perf_counter()
 

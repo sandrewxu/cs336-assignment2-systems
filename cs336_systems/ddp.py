@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-class DDP(nn.Module):
+class DDP_overlap(nn.Module):
     """
     Python class to handle distributed data parallel training.
     Takes care of broadcasting weights before training and issuing
@@ -26,8 +26,10 @@ class DDP(nn.Module):
         self.world_size = dist.get_world_size()
         # Broadcast to GPUs; hook parameters; handle tracking
         for p in self.module.parameters():
-            dist.broadcast(p, src=0)
-            p.register_post_accumulate_grad_hook(self.hook)
+            with torch.inference_mode():
+                dist.broadcast(p, src=0)
+            if p.requires_grad:
+                p.register_post_accumulate_grad_hook(self.hook)
 
     def hook(self, p: torch.Tensor):
         if p.grad is not None:
