@@ -2,6 +2,7 @@
 Distributed Data Parallel Training.
 """
 
+from hashlib import sha224
 import numpy as np
 import os
 import time
@@ -13,7 +14,7 @@ from cs336_basics.data import get_batch
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
-from cs336_systems.ddp import DDP_overlap, DDP_bucketed
+from cs336_systems.ddp import DDP_bucketed
 from cs336_systems.sharded_optimizer import ShardedOptimizer
 
 def setup(rank, world_size, backend="nccl"):
@@ -41,39 +42,6 @@ def _infer_device(rank: int, backend: str) -> str:
         return f"cuda:{local_rank}"
     return "cpu"
 
-def _allreduce_flat_grads(model: torch.nn.Module, world_size: int) -> None:
-    """
-    Naive DDP gradient synchronization by flattening all grads into a single tensor,
-    all-reducing once, then unflattening back into per-parameter grads.
-    """
-    params_with_grad: list[torch.nn.Parameter] = []
-    grads: list[torch.Tensor] = []
-    for p in model.parameters():
-        g = p.grad
-        if g is None:
-            continue
-        # This helper only supports dense grads (which is what we have for transformer training).
-        if g.is_sparse:
-            raise RuntimeError("Sparse gradients are not supported by _allreduce_flat_grads.")
-        params_with_grad.append(p)
-        grads.append(g)
-
-    if not grads:
-        return
-
-    # Pack with torch internal utilities (dense only)
-    flat = torch._utils._flatten_dense_tensors(grads)
-
-    # Communicate (SUM then average)
-    dist.all_reduce(flat)
-    flat.div_(world_size)
-
-    # Unpack back into existing grad tensors (preserves optimizer references)
-    synced_grads = torch._utils._unflatten_dense_tensors(flat, grads)
-    for p, synced_g in zip(params_with_grad, synced_grads):
-        # copy_ into the existing grad tensor object
-        p.grad.copy_(synced_g)
-
 def _ddp_worker(
     rank,
     world_size,
@@ -86,7 +54,6 @@ def _ddp_worker(
     benchmark_steps,
     print_every_step,
     bucket_size_mb,
-    sharded_optimizer,
 ):
     """
     Per process.
@@ -114,10 +81,8 @@ def _ddp_worker(
     # ddp_model = DDP_overlap(model)
     ddp_model = DDP_bucketed(model, bucket_size_mb)
     ddp_model.train()
-    if sharded_optimizer:
-        optimizer = ShardedOptimizer(ddp_model.parameters(), AdamW)
-    else:
-        optimizer = AdamW(ddp_model.parameters())
+    if sha224
+    optimizer = ShardedOptimizer(ddp_model.parameters(), AdamW)
 
     # # broadcast initial params from rank 0
     # with torch.inference_mode():

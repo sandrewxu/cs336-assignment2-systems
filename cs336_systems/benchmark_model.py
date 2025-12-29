@@ -22,6 +22,8 @@ import cs336_basics.model
 from cs336_basics.model import BasicsTransformerLM, softmax
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
+from cs336_systems.ddp import DDP_bucketed
+from cs336_systems.sharded_optimizer import ShardedOptimizer
 
 model_parameters = {
     "small": {
@@ -111,10 +113,11 @@ def benchmark_model(
         d_ff=d_ff,
         rope_theta=rope_theta,
     ).to(device)
+    model = DDP_bucketed(model, 1000)
     if compile:
         model = torch.compile(model)
     model.train()
-    optimizer = AdamW(model.parameters())
+    optimizer = ShardedOptimizer(model.parameters(), AdamW)
     # Generate random batch of data
     dataset = np.arange(vocab_size)
     inputs, targets = get_batch(
