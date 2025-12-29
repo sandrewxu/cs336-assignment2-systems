@@ -13,7 +13,7 @@ from cs336_basics.data import get_batch
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
-from cs336_systems.ddp import DDP_overlap
+from cs336_systems.ddp import DDP_overlap, DDP_bucketed
 
 def setup(rank, world_size, backend="nccl"):
     os.environ["MASTER_ADDR"] = "localhost"
@@ -84,6 +84,7 @@ def _ddp_worker(
     warmup_steps,
     benchmark_steps,
     print_every_step,
+    bucket_size_mb,
 ):
     """
     Per process.
@@ -108,7 +109,8 @@ def _ddp_worker(
         rope_theta=rope_theta,
     ).to(device)
 
-    ddp_model = DDP_overlap(model)
+    # ddp_model = DDP_overlap(model)
+    ddp_model = DDP_bucketed(model, bucket_size_mb)
     ddp_model.train()
     optimizer = AdamW(ddp_model.parameters())
 
@@ -224,6 +226,7 @@ def benchmark_xl_naive_ddp(
     warmup_steps=5,
     benchmark_steps=10,
     print_every_step=False,
+    bucket_size_mb=1,
 ):
     mp.spawn(
         _ddp_worker,
@@ -237,10 +240,13 @@ def benchmark_xl_naive_ddp(
             warmup_steps,
             benchmark_steps,
             print_every_step,
+            bucket_size_mb,
         ),
         nprocs=world_size,
         join=True,
     )
 
 if __name__ == "__main__":
-    benchmark_xl_naive_ddp(world_size=2, backend="nccl")
+    for size in [1, 10, 100, 1000]:
+        print(f"=== BUCKET SIZE (MB): {size} ===")
+        benchmark_xl_naive_ddp(world_size=2, backend="nccl", bucket_size_mb=size)

@@ -75,15 +75,20 @@ class DDP_bucketed(nn.Module):
         buckets = [[]]
         running_size = 0
         for p in reversed(list(self.module.parameters())):
-            current_size = (p.numel() * p.element_size()) / (1024 * 1024)
-            running_size += current_size
+            if not p.requires_grad:
+                continue
+            buckets[-1].append(p)
+            running_size += (p.numel() * p.element_size()) / (1024 * 1024)
             if running_size > bucket_size_mb:
                 buckets.append([])
-                running_size = current_size
-            buckets[-1].append(p)
+                running_size = 0
+
+        if not buckets[-1]:
+            buckets.pop()
 
         # Iterate through buckets
         self.param_to_bucket_id = {}
+        self.param_to_grad_view = {}
         self.bucket_buffers = []
         self.bucket_grad_buffers = []
         self.bucket_total_counts = []
@@ -91,25 +96,32 @@ class DDP_bucketed(nn.Module):
         for (i, bucket_params) in enumerate(buckets):
             flat_bucket = torch._utils._flatten_dense_tensors(bucket_params)
             flat_grad_bucket = torch.zeros_like(flat_bucket)
-            with torch.inference_mode():
-                dist.broadcast(flat_bucket, src=0)
             views = torch._utils._unflatten_dense_tensors(flat_bucket, bucket_params)
             grad_views = torch._utils._unflatten_dense_tensors(flat_grad_bucket, bucket_params)
 
             for p, v, g_v in zip(bucket_params, views, grad_views):
                 self.param_to_bucket_id[p] = i
+                self.param_to_grad_view[p] = g_v
                 p.data = v  # link param data to bucket
                 p.grad = g_v
-                if p.requires_grad:
-                    p.register_post_accumulate_grad_hook(self.hook)
+                p.register_post_accumulate_grad_hook(self.hook)
 
             self.bucket_buffers.append(flat_bucket)
             self.bucket_grad_buffers.append(flat_grad_bucket)
             self.bucket_total_counts.append(len(bucket_params))
             self.bucket_remaining_counts.append(len(bucket_params))
 
+        for p in self.module.parameters():
+            with torch.inference_mode():
+                dist.broadcast(p, src=0)
+
     def hook(self, p: torch.Tensor):
         bucket_id = self.param_to_bucket_id[p]
+        grad_view = self.param_to_grad_view[p]
+
+        if p.grad is not None:
+            grad_view.copy_(p.grad)
+
         self.bucket_remaining_counts[bucket_id] -= 1
 
         if self.bucket_remaining_counts[bucket_id] == 0:
@@ -132,4 +144,7 @@ class DDP_bucketed(nn.Module):
         for handle in self.communication_handles:
             handle.wait()
         self.communication_handles = []
+        for p, grad_view in self.param_to_grad_view.items():
+            if p.requires_grad:
+                p.grad = grad_view
         self.bucket_remaining_counts = copy.deepcopy(self.bucket_total_counts)
